@@ -7,9 +7,13 @@ discord:
   token: ""             # or set the DISCORD_TOKEN environment variable
   alerts_channel_id: 0  # required: channel for watchdog alerts
   logs_channel_id: 0    # optional: channel for relayed log lines (0 = disabled)
-  # Prepended to critical alerts (offline, SDR down, lost calls), e.g.
-  # "<@&123456789012345678>" for a role ping, or "@here".
-  mention_on_critical: ""
+  # Prepended to critical alerts (offline, SDR down, lost calls).
+  #   "@everyone"              -> everyone who can see the alerts channel
+  #   "@here"                  -> same, but only members currently online
+  #   "<@&123456789012345678>" -> a specific role
+  # The bot needs the "Mention @everyone, @here and All Roles" permission in
+  # the alerts channel or the ping is silently suppressed.
+  mention_on_critical: "@everyone"
 
 systemd:
   # The trunk-recorder unit to watch. Drives online/offline alerts, restart /

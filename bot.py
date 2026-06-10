@@ -139,7 +139,11 @@ def load_config(path: str) -> dict:
 
 class TRBot(discord.Client):
     def __init__(self, cfg: dict):
-        super().__init__(intents=discord.Intents.default())
+        super().__init__(
+            intents=discord.Intents.default(),
+            # Honor whatever mention_on_critical contains (@everyone/@here/roles);
+            # the bot also needs the "Mention @everyone" permission in the channel.
+            allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=True))
         self.cfg = cfg
         self.tree = app_commands.CommandTree(self)
         self.unit = cfg["systemd"]["unit"]
