@@ -13,6 +13,7 @@ dongles. No broker, no plugin, nothing to add to trunk-recorder's build.
 | Crash loop (e.g. SDR missing at startup) | `NRestarts` climbing — N restarts within a window collapse into one alert with the journal excerpt | 🔴 critical, with "stable again" notice |
 | SDR dongle leaves/rejoins the USB bus | udev events on the host, plus a presence check at bot startup | 🔴 critical, with reconnect notice |
 | SDR/antenna/RF trouble on a trunked system | trunk-recorder's own decode-rate log lines (logged every ~3 s while the rate is below `controlWarnRate`) | 🟠 critical, with recovery notice |
+| A system stops recording (the health signal for **conventional** systems) | Per-system activity watchdog: no `Concluding Recorded Call` log line for longer than a configurable quiet window | 🟠 (critical optional), with "recording again" notice |
 | Upload failures to OpenMHz / Broadcastify Calls / Rdio Scanner | Error log lines matched per service, rate-limited per service | 🟠 (🔴 + ping when calls are permanently lost after retries) |
 | Hung process (optional) | Unit active but journal silent — requires `controlWarnRate: -1` so trunk-recorder logs its rate every ~3 s as a heartbeat | 🟠 critical |
 | Log relay | `warning`+ journal lines forwarded, batched into code blocks | posted to a logs channel |
@@ -57,9 +58,15 @@ Limitations worth knowing:
 - Everything here assumes trunk-recorder runs as a **systemd unit** on the
   same host as the bot. A whole-host failure (power, kernel panic) takes the
   bot down too — that needs an external watchdog.
-- Decode-rate monitoring only covers **trunked** systems; conventional
-  systems don't have a decode rate. The USB watcher covers the dead-dongle
-  case there.
+- **Conventional systems (analog or digital) have no decode rate at all**, so
+  decode-rate monitoring and the `controlWarnRate: -1` heartbeat only apply
+  to trunked systems — and log-silence hang detection needs at least one
+  trunked system to be meaningful. For conventional systems the health
+  layers are: the USB watcher (dead dongle), the systemd watcher (dead
+  process), and the **activity watchdog** ("this channel normally records
+  something every N hours"). A quiet-but-healthy channel and a deaf SDR look
+  identical in-band, so pick `max_quiet_hours` generously for low-traffic
+  channels.
 - With trunk-recorder's default `controlWarnRate` (10), healthy systems log
   no rate lines, so `/trstatus` shows the last *unhealthy* rate seen and
   recovery is inferred when the low-rate lines stop. Set

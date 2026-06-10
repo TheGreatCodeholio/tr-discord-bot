@@ -55,6 +55,21 @@ logs:
   min_severity: warning         # trace|debug|info|warning|error|fatal
   batch_interval_s: 5           # batch window for relayed log lines
 
+activity:
+  # Recording-activity watchdog. Conventional systems (analog or digital)
+  # never log a decode rate — the only in-band sign of life is that calls
+  # keep getting recorded. Alert when a system records nothing for longer
+  # than max_quiet_hours (tune to the channel: a busy dispatch channel might
+  # use 1-2h, a quiet tac channel 24h+). Also works for trunked systems as a
+  # sanity check on top of decode rates. critical: true adds the
+  # mention_on_critical ping. Timers reset when the bot or trunk-recorder
+  # (re)starts.
+  systems: []
+  # systems:
+  #   - system: "countyFD"        # shortName from trunk-recorder config.json
+  #     max_quiet_hours: 6
+  #     critical: false
+
 usb:
   # SDRs to watch via udev. Find IDs with `lsusb` (ID 0bda:2838) and serials
   # via sysfs: for d in /sys/bus/usb/devices/*/; do cat $d/serial; done

@@ -55,7 +55,13 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 TIME_RE = re.compile(r"(\d{2}:\d{2}:\d{2})")
 
 # monitor_systems.cc: "[<shortname>]\tfreq: ...\tControl Channel Message Decode Rate: <n>/sec, count: ..."
+# Only trunked systems ever log this; conventional systems have no decode rate.
 RATE_RE = re.compile(r"\[(?P<sys>[^\]]+)\].*Control Channel Message Decode Rate:\s*(?P<rate>-?\d+)/sec")
+
+# call_impl.cc logs this once per completed call on EVERY system type (trunked,
+# conventional P25, analog) — the only in-band health signal conventional
+# systems produce: "[<shortname>]\t<n>C\tTG: ...\tConcluding Recorded Call - ..."
+ACTIVITY_RE = re.compile(r"^\[(?P<sys>[^\]]+)\].*Concluding Recorded Call")
 
 # Probe output classification. Exit codes are useless here — rtl_test exits 0
 # even when it fails to open the device — so the output text is the verdict.
@@ -120,6 +126,9 @@ def load_config(path: str) -> dict:
             "devices": [],
             "probe_timeout_s": 15,
         },
+        "activity": {
+            "systems": [],
+        },
         "systemd": {
             "unit": "trunk-recorder.service",
             "poll_interval_s": 10,
@@ -159,6 +168,16 @@ class TRBot(discord.Client):
         self.uploads: dict[str, UploadHealth] = {}
         self.usb_present: dict[str, bool] = {}    # label -> currently on the bus
         self.started = time.time()
+
+        # Recording-activity watchdog (the health signal for conventional
+        # systems, which never log a decode rate). Seeded with the bot start
+        # time; a bot restart resets the quiet timers.
+        self.rec_activity: dict[str, dict] = {
+            str(entry["system"]): {"last": self.started, "quiet": False,
+                                   "max_s": float(entry.get("max_quiet_hours", 12)) * 3600,
+                                   "critical": bool(entry.get("critical", False))}
+            for entry in cfg["activity"]["systems"] if entry.get("system")
+        }
 
         # Log relay
         self.log_queue: asyncio.Queue = asyncio.Queue()
@@ -265,6 +284,11 @@ class TRBot(discord.Client):
             flag = " \N{LARGE RED CIRCLE} DOWN" if h.down else ""
             age = f", {now - h.last_seen:.0f}s ago" if h.last_seen else ""
             embed.add_field(name=f"System: {name}", value=f"{h.last_rate:.0f} msg/s{age}{flag}", inline=True)
+        for name, a in sorted(self.rec_activity.items()):
+            quiet_h = (now - a["last"]) / 3600
+            flag = " \N{LARGE RED CIRCLE} QUIET" if a["quiet"] else ""
+            embed.add_field(name=f"Activity: {name}",
+                            value=f"last recording {quiet_h:.1f}h ago{flag}", inline=True)
         for svc, u in sorted(self.uploads.items()):
             embed.add_field(
                 name=f"Uploads: {svc}",
@@ -344,8 +368,23 @@ class TRBot(discord.Client):
         if rate_match:
             await self.handle_decode_rate(rate_match.group("sys"), float(rate_match.group("rate")))
 
+        activity_match = ACTIVITY_RE.match(body)
+        if activity_match:
+            await self.handle_activity(activity_match.group("sys"))
+
         if rank >= SEVERITY_RANK["error"]:
             await self.classify_upload_failure(body)
+
+    async def handle_activity(self, name: str):
+        a = self.rec_activity.get(name)
+        if a is None:
+            return
+        a["last"] = time.time()
+        if a["quiet"]:
+            a["quiet"] = False
+            await self.send_alert(
+                f"Recording again: {name}",
+                "A call was just recorded after the quiet period.", GREEN)
 
     # ------------------------------------------------------------------
     # Decode rates (SDR / control channel health)
@@ -513,6 +552,9 @@ class TRBot(discord.Client):
         if self.crash_looping:
             return  # the crash-loop alert covers the churn
         if online:
+            # Don't count the downtime against the recording-activity timers.
+            for a in self.rec_activity.values():
+                a["last"] = max(a["last"], time.time())
             await self.send_alert(f"{self.unit} is back online",
                                   "The unit is active and running.", GREEN)
         else:
@@ -626,6 +668,18 @@ class TRBot(discord.Client):
                         f"Recovered: {name}",
                         f"No low decode-rate lines for {clear_s:.0f}s — the rate is back above "
                         "trunk-recorder's warn threshold.", GREEN)
+
+            # Recording-activity watchdog (conventional systems' health signal)
+            if self.online:
+                for name, a in self.rec_activity.items():
+                    if not a["quiet"] and (now - a["last"]) > a["max_s"]:
+                        a["quiet"] = True
+                        await self.send_alert(
+                            f"No recordings: {name}",
+                            f"Nothing has been recorded on **{name}** for over "
+                            f"{a['max_s'] / 3600:.1f} hours. For a conventional system this can "
+                            "mean a dead SDR/antenna or squelch set too tight — or just a quiet "
+                            "channel. Worth a look.", ORANGE, critical=a["critical"])
 
             await asyncio.sleep(5)
 
