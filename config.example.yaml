@@ -54,6 +54,11 @@ watchdog:
 logs:
   min_severity: warning         # trace|debug|info|warning|error|fatal
   batch_interval_s: 5           # batch window for relayed log lines
+  # Auto-delete the bot's own messages in the logs channel after this many
+  # hours (checked hourly; 0 = keep forever). Needs the Manage Messages and
+  # Read Message History permissions in the logs channel. /trclear is the
+  # on-demand version for any channel.
+  retention_hours: 0            # e.g. 72
 
 activity:
   # Recording-activity watchdog. Conventional systems (analog or digital)

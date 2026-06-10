@@ -29,6 +29,14 @@ Slash commands:
   stops in-progress recordings, posts an audit alert naming the requester,
   and reports the resulting unit state (with a journal excerpt on failure).
   Needs a sudoers rule on the host — see setup below.
+- `/trclear target: logs|alerts|both confirm: True` — purge the bot's
+  messages from the chosen channel(s) (`all_messages: True` to delete other
+  users' messages too; pinned messages are always kept). Restricted to
+  members with **Manage Messages** by default. There is also an automatic
+  retention policy for the logs channel (`logs.retention_hours`). Both need
+  the bot to have **Manage Messages** and **Read Message History** in the
+  channel. Discord only bulk-deletes messages younger than 14 days; older
+  backlog is deleted one-by-one, capped at 500 per run — re-run to continue.
 
 ### Dongle health is three layers
 
@@ -102,7 +110,9 @@ so systemd can restart it.
 1. Create an application at <https://discord.com/developers/applications>,
    add a **Bot**, and copy the token.
 2. Invite it with the **bot** and **applications.commands** scopes and
-   *Send Messages* + *Embed Links* permissions.
+   *Send Messages*, *Embed Links*, *Read Message History*, and
+   *Manage Messages* permissions (the last two are for `/trclear` and log
+   retention; add *Mention @everyone* if you use `mention_on_critical`).
 3. Enable Developer Mode in Discord, right-click your alert channel (and
    optionally a logs channel) → *Copy Channel ID*.
 

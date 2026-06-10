@@ -24,6 +24,7 @@ also be supplied via the DISCORD_TOKEN environment variable.
 
 import argparse
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -32,7 +33,7 @@ import shlex
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional
 
 import discord
 import yaml
@@ -71,6 +72,10 @@ PROBE_BUSY_RE = re.compile(
     r"usb_claim_interface|resource busy|already in use|\bbusy\b", re.IGNORECASE)
 PROBE_FAIL_RE = re.compile(
     r"Failed to open|No supported devices|no device|not found|cannot open|Permission denied", re.IGNORECASE)
+
+# Discord only allows bulk deletion of messages younger than 14 days; older
+# ones go one-by-one against the rate limiter, so each purge pass is capped.
+SLOW_DELETE_CAP = 500
 
 DEFAULT_UPLOAD_SERVICES = ["OpenMHz", "Broadcastify", "Rdio Scanner"]
 UPLOAD_ERROR_RE = re.compile(r"Upload (?:Error|REJECTED|failed)", re.IGNORECASE)
@@ -121,6 +126,7 @@ def load_config(path: str) -> dict:
         "logs": {
             "min_severity": "warning",
             "batch_interval_s": 5,
+            "retention_hours": 0,
         },
         "usb": {
             "devices": [],
@@ -199,6 +205,43 @@ class TRBot(discord.Client):
             embed = await self.probe_embed()
             await interaction.followup.send(embed=embed)
 
+        @self.tree.command(name="trclear", description="Clear bot messages from the alerts/logs channels")
+        @app_commands.describe(
+            target="Which channel to clear",
+            all_messages="Also delete other users' messages (default: only the bot's)",
+            confirm="Set to True to actually delete")
+        @app_commands.default_permissions(manage_messages=True)
+        async def trclear(interaction: discord.Interaction,
+                          target: Literal["logs", "alerts", "both"] = "logs",
+                          all_messages: bool = False,
+                          confirm: bool = False):
+            if not confirm:
+                await interaction.response.send_message(
+                    f"This will delete {'ALL' if all_messages else 'the bot’s'} messages in the "
+                    f"**{target}** channel(s). Re-run with `confirm: True` to proceed.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            targets = []
+            if target in ("logs", "both"):
+                targets.append(("logs", self.cfg["discord"]["logs_channel_id"]))
+            if target in ("alerts", "both"):
+                targets.append(("alerts", self.cfg["discord"]["alerts_channel_id"]))
+            lines = []
+            for name, cid in targets:
+                if not cid:
+                    lines.append(f"{name}: not configured")
+                    continue
+                result = await self.purge_channel(cid, only_bot=not all_messages)
+                if result is None:
+                    lines.append(f"{name}: channel unavailable")
+                elif result < 0:
+                    lines.append(f"{name}: missing permissions (the bot needs **Manage Messages** "
+                                 "and **Read Message History** in that channel)")
+                else:
+                    more = " (older backlog may remain — run again)" if result >= SLOW_DELETE_CAP else ""
+                    lines.append(f"{name}: deleted {result} message(s){more}")
+            await interaction.followup.send("\n".join(lines), ephemeral=True)
+
         @self.tree.command(name="trrestart", description="Restart the trunk-recorder systemd service")
         @app_commands.describe(confirm="Set to True to actually restart — this stops any in-progress recordings")
         @app_commands.default_permissions(manage_guild=True)
@@ -223,6 +266,7 @@ class TRBot(discord.Client):
         asyncio.create_task(self.watchdog_loop(), name="watchdog_loop")
         asyncio.create_task(self.log_flusher(), name="log_flusher")
         asyncio.create_task(self.usb_watcher(), name="usb_watcher")
+        asyncio.create_task(self.retention_loop(), name="retention_loop")
 
     async def on_ready(self):
         log.info("Logged in to Discord as %s", self.user)
@@ -300,6 +344,62 @@ class TRBot(discord.Client):
                             value="on the bus" if present else "\N{LARGE RED CIRCLE} MISSING", inline=True)
         embed.set_footer(text=f"{self.unit} • bot up {(now - self.started) / 3600:.1f}h")
         return embed
+
+    # ------------------------------------------------------------------
+    # Channel cleanup — /trclear and the logs retention loop
+    # ------------------------------------------------------------------
+
+    async def purge_channel(self, channel_id: int, before_dt: Optional[datetime.datetime] = None,
+                            only_bot: bool = True) -> Optional[int]:
+        """Delete messages from a channel. Returns the count, None if the
+        channel is unavailable, or -1 on missing permissions."""
+        ch = await self.get_channel_checked(channel_id)
+        if ch is None:
+            return None
+
+        def check(m: discord.Message) -> bool:
+            if m.pinned:
+                return False
+            return m.author == self.user if only_bot else True
+
+        bulk_cutoff = discord.utils.utcnow() - datetime.timedelta(days=13, hours=23)
+        total = 0
+        try:
+            # Fast pass: bulk delete only works on messages younger than 14 days.
+            if before_dt is None or before_dt > bulk_cutoff:
+                deleted = await ch.purge(limit=None, check=check, before=before_dt,
+                                         after=bulk_cutoff, bulk=True, oldest_first=False,
+                                         reason="tr-discord-bot cleanup")
+                total += len(deleted)
+            # Slow pass: anything older must go one at a time (rate-limited),
+            # so it's capped per run.
+            slow_before = bulk_cutoff if (before_dt is None or before_dt > bulk_cutoff) else before_dt
+            deleted = await ch.purge(limit=SLOW_DELETE_CAP, check=check, before=slow_before,
+                                     bulk=False, oldest_first=True,
+                                     reason="tr-discord-bot cleanup")
+            total += len(deleted)
+        except discord.Forbidden:
+            return -1
+        except discord.DiscordException:
+            log.exception("Purge failed in channel %s", channel_id)
+        return total
+
+    async def retention_loop(self):
+        """Auto-delete the bot's own log-relay messages past logs.retention_hours."""
+        hours = float(self.cfg["logs"]["retention_hours"])
+        channel_id = self.cfg["discord"]["logs_channel_id"]
+        if hours <= 0 or not channel_id:
+            return
+        await self.wait_until_ready()
+        while not self.is_closed():
+            before = discord.utils.utcnow() - datetime.timedelta(hours=hours)
+            result = await self.purge_channel(channel_id, before_dt=before, only_bot=True)
+            if result == -1:
+                log.error("Log retention needs Manage Messages + Read Message History "
+                          "in the logs channel; retrying in an hour")
+            elif result:
+                log.info("Log retention: deleted %d message(s) older than %.0fh", result, hours)
+            await asyncio.sleep(3600)
 
     # ------------------------------------------------------------------
     # Journal tail — log relay, upload failures, decode rates
