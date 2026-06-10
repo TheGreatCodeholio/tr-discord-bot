@@ -18,7 +18,26 @@ dongles. No broker, no plugin, nothing to add to trunk-recorder's build.
 | Log relay | `warning`+ journal lines forwarded, batched into code blocks | posted to a logs channel |
 
 There is also a `/trstatus` slash command showing unit state, restart count,
-per-system decode rates, dongle presence, and upload-failure counters.
+per-system decode rates, dongle presence, and upload-failure counters, and a
+`/trprobe` command that actively probes the dongles at the driver level.
+
+### Dongle health is three layers
+
+1. **On the bus** (udev) — physical connectivity only. A dongle can be
+   present and still unusable.
+2. **Openable by the driver** — an active probe (`rtl_test -d <serial> -t`,
+   `airspy_info`, `hackrf_info`, `SoapySDRUtil --probe=...`, configurable per
+   device). The bot classifies the probe *output*, not its exit code —
+   `rtl_test` exits 0 even when it fails to open the device. A result of
+   **claimed** (another process holds the dongle) is healthy while
+   trunk-recorder is running and a red flag while it isn't (some other
+   program is squatting on the SDR and trunk-recorder will fail to start).
+3. **Producing data** — the decode-rate monitoring. While trunk-recorder is
+   recording, this *is* the driver test; an SDR can only be opened by one
+   process, so the bot deliberately never probes on a schedule. Probes run
+   only on demand (`/trprobe`), automatically when a crash loop is detected
+   (to tell hardware/driver trouble from a config problem), and ~3 s after a
+   dongle returns to the bus (to confirm it actually came back usable).
 
 Because the bot reads the journal directly, it sees **everything the process
 ever prints** — including startup errors like `Failed to open rtlsdr device`

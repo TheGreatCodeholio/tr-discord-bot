@@ -51,12 +51,25 @@ usb:
   # via sysfs: for d in /sys/bus/usb/devices/*/; do cat $d/serial; done
   # (or rtl_eeprom). Empty list disables the watcher. serial is optional but
   # required in practice with multiple identical dongles.
+  #
+  # probe (optional): a command that opens the device at the driver level,
+  # for /trprobe, crash-loop diagnosis, and verification after a reconnect.
+  # The bot classifies the OUTPUT (ok / claimed / failed) because tools like
+  # rtl_test exit 0 even when they fail to open the device. "claimed" is
+  # healthy while trunk-recorder runs and an alert when it doesn't.
+  # Examples for other hardware:
+  #   Airspy:    probe: "airspy_info"
+  #   HackRF:    probe: "hackrf_info"
+  #   SoapySDR:  probe: "SoapySDRUtil --probe=driver=sdrplay"
+  probe_timeout_s: 15
   devices:
     - label: "RTL-SDR Blog V4 #00000110"
       vendor_id: "0bda"
       product_id: "2838"
       serial: "00000110"
+      probe: "rtl_test -d 00000110 -t"
     - label: "RTL-SDR Blog V4 #00000109"
       vendor_id: "0bda"
       product_id: "2838"
       serial: "00000109"
+      probe: "rtl_test -d 00000109 -t"

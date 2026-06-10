@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -55,6 +56,15 @@ TIME_RE = re.compile(r"(\d{2}:\d{2}:\d{2})")
 
 # monitor_systems.cc: "[<shortname>]\tfreq: ...\tControl Channel Message Decode Rate: <n>/sec, count: ..."
 RATE_RE = re.compile(r"\[(?P<sys>[^\]]+)\].*Control Channel Message Decode Rate:\s*(?P<rate>-?\d+)/sec")
+
+# Probe output classification. Exit codes are useless here — rtl_test exits 0
+# even when it fails to open the device — so the output text is the verdict.
+PROBE_OK_RE = re.compile(
+    r"Found .* tuner|Supported gain values|Sampling at|Serial number:|Firmware Version", re.IGNORECASE)
+PROBE_BUSY_RE = re.compile(
+    r"usb_claim_interface|resource busy|already in use|\bbusy\b", re.IGNORECASE)
+PROBE_FAIL_RE = re.compile(
+    r"Failed to open|No supported devices|no device|not found|cannot open|Permission denied", re.IGNORECASE)
 
 DEFAULT_UPLOAD_SERVICES = ["OpenMHz", "Broadcastify", "Rdio Scanner"]
 UPLOAD_ERROR_RE = re.compile(r"Upload (?:Error|REJECTED|failed)", re.IGNORECASE)
@@ -108,6 +118,7 @@ def load_config(path: str) -> dict:
         },
         "usb": {
             "devices": [],
+            "probe_timeout_s": 15,
         },
         "systemd": {
             "unit": "trunk-recorder.service",
@@ -157,6 +168,12 @@ class TRBot(discord.Client):
         @self.tree.command(name="trstatus", description="Show trunk-recorder watchdog status")
         async def trstatus(interaction: discord.Interaction):
             await interaction.response.send_message(embed=self.status_embed())
+
+        @self.tree.command(name="trprobe", description="Actively probe the configured SDR dongles (driver-level check)")
+        async def trprobe(interaction: discord.Interaction):
+            await interaction.response.defer()
+            embed = await self.probe_embed()
+            await interaction.followup.send(embed=embed)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -472,6 +489,8 @@ class TRBot(discord.Client):
                             f"**{len(recent)}** restarts in the last {int(sd['restart_window_s']) // 60} "
                             f"minutes (exit status {exec_status}). Recent journal:\n"
                             f"```text\n{journal}\n```", RED, critical=True)
+                        # Tell driver/hardware trouble apart from a config problem
+                        await self.send_probe_report("crash-loop diagnosis")
                 elif now - last_restart_alert >= float(sd["restart_alert_cooldown_s"]):
                     last_restart_alert = now
                     journal = await self.journal_tail(int(sd["journal_lines"]))
@@ -542,6 +561,103 @@ class TRBot(discord.Client):
                         "trunk-recorder's warn threshold.", GREEN)
 
             await asyncio.sleep(5)
+
+    # ------------------------------------------------------------------
+    # Active dongle probes — driver-level health, beyond bus presence
+    #
+    # Never run periodically while trunk-recorder is recording: an SDR can
+    # only be opened by one process, so probing a healthy in-use dongle just
+    # reports "claimed" (and the decode rate already proves the driver works
+    # end-to-end). Probes run on demand (/trprobe), when a crash loop is
+    # detected, and after a dongle returns to the bus.
+    # ------------------------------------------------------------------
+
+    async def probe_device(self, spec: dict) -> tuple:
+        """Run the device's probe command. Returns (status, detail) where
+        status is ok | claimed | failed | no-probe."""
+        cmd = spec.get("probe", "")
+        if not cmd:
+            return "no-probe", "no probe command configured"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *shlex.split(cmd),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        except (FileNotFoundError, ValueError) as exc:
+            return "failed", f"cannot run probe: {exc}"
+        timed_out = False
+        try:
+            out, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=float(self.cfg["usb"]["probe_timeout_s"]))
+        except asyncio.TimeoutError:
+            timed_out = True
+            proc.kill()
+            out, _ = await proc.communicate()
+        text = out.decode(errors="replace")
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        detail = (lines[-1] if lines else "(no output)")[:200]
+        # Output beats exit codes: rtl_test exits 0 even on open failure.
+        if PROBE_BUSY_RE.search(text):
+            return "claimed", detail
+        if PROBE_OK_RE.search(text):
+            return "ok", detail
+        if PROBE_FAIL_RE.search(text):
+            return "failed", detail
+        if timed_out:
+            return "failed", f"probe timed out: {detail}"
+        return ("ok" if proc.returncode == 0 else "failed"), detail
+
+    def probe_verdict(self, status: str) -> str:
+        if status == "ok":
+            return "\N{WHITE HEAVY CHECK MARK} opens and responds — driver working"
+        if status == "claimed":
+            if self.online:
+                return "\N{LOCK} claimed by another process (expected — trunk-recorder is running)"
+            return ("\N{WARNING SIGN} claimed by another process while trunk-recorder is **not** "
+                    "running — something else is holding the dongle and trunk-recorder will fail to open it")
+        if status == "no-probe":
+            return "\N{WHITE QUESTION MARK ORNAMENT} bus presence only (no probe command configured)"
+        return "\N{CROSS MARK} present on the bus but the driver **cannot open it** — power-cycle / replug likely needed"
+
+    async def probe_all(self) -> list:
+        results = []
+        for spec in self.cfg["usb"]["devices"]:
+            label = spec.get("label", f"{spec.get('vendor_id')}:{spec.get('product_id')}")
+            present = self.usb_present.get(label, None)
+            status, detail = await self.probe_device(spec)
+            results.append((label, present, status, detail))
+        return results
+
+    async def probe_embed(self) -> discord.Embed:
+        results = await self.probe_all()
+        if not results:
+            return discord.Embed(title="Dongle probe", color=BLUE,
+                                 description="No `usb.devices` configured.")
+        if any(s == "failed" for _, _, s, _ in results):
+            color = RED
+        elif any(s == "claimed" for _, _, s, _ in results) and not self.online:
+            color = ORANGE  # something other than trunk-recorder is holding a dongle
+        else:
+            color = GREEN
+        embed = discord.Embed(title="Dongle probe", color=color)
+        for label, present, status, detail in results:
+            bus = {True: "on the bus", False: "\N{LARGE RED CIRCLE} NOT on the bus", None: "bus state unknown"}[present]
+            embed.add_field(name=label,
+                            value=f"{bus}\n{self.probe_verdict(status)}\n`{detail}`",
+                            inline=False)
+        embed.set_footer(text=self.unit)
+        return embed
+
+    async def send_probe_report(self, reason: str):
+        if not any(spec.get("probe") for spec in self.cfg["usb"]["devices"]):
+            return
+        embed = await self.probe_embed()
+        embed.title = f"Dongle probe — {reason}"
+        ch = await self.get_channel_checked(self.cfg["discord"]["alerts_channel_id"])
+        if ch is not None:
+            try:
+                await ch.send(embed=embed)
+            except discord.DiscordException:
+                log.exception("Failed to send probe report")
 
     # ------------------------------------------------------------------
     # USB dongle watcher (udev) — works even when trunk-recorder is dead
@@ -636,6 +752,18 @@ class TRBot(discord.Client):
                             f"SDR connected: {label}",
                             "The dongle is back on the USB bus. trunk-recorder may need a "
                             "restart to pick it up.", GREEN)
+                        if spec.get("probe"):
+                            # Give udev a moment to settle, then verify the
+                            # driver can actually open the returned dongle.
+                            async def _probe_after_settle(s=spec, lb=label):
+                                await asyncio.sleep(3)
+                                status, detail = await self.probe_device(s)
+                                await self.send_alert(
+                                    f"Probe after reconnect: {lb}",
+                                    f"{self.probe_verdict(status)}\n`{detail}`",
+                                    GREEN if status in ("ok", "claimed") else RED,
+                                    critical=(status == "failed"))
+                            asyncio.create_task(_probe_after_settle())
 
     # ------------------------------------------------------------------
     # Log relay flusher — batches lines, never drops them
