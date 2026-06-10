@@ -127,6 +127,7 @@ def load_config(path: str) -> dict:
             "restart_window_s": 300,
             "restart_threshold": 3,
             "restart_alert_cooldown_s": 600,
+            "restart_cmd": "sudo -n systemctl restart {unit}",
         },
     }
     for section, keys in defaults.items():
@@ -173,6 +174,19 @@ class TRBot(discord.Client):
         async def trprobe(interaction: discord.Interaction):
             await interaction.response.defer()
             embed = await self.probe_embed()
+            await interaction.followup.send(embed=embed)
+
+        @self.tree.command(name="trrestart", description="Restart the trunk-recorder systemd service")
+        @app_commands.describe(confirm="Set to True to actually restart — this stops any in-progress recordings")
+        @app_commands.default_permissions(manage_guild=True)
+        async def trrestart(interaction: discord.Interaction, confirm: bool = False):
+            if not confirm:
+                await interaction.response.send_message(
+                    f"This will restart `{self.unit}` and stop any in-progress recordings.\n"
+                    "Re-run as `/trrestart confirm: True` to proceed.", ephemeral=True)
+                return
+            await interaction.response.defer()
+            embed = await self.restart_unit(str(interaction.user))
             await interaction.followup.send(embed=embed)
 
     # ------------------------------------------------------------------
@@ -424,6 +438,60 @@ class TRBot(discord.Client):
         except FileNotFoundError:
             return "(journalctl not available)"
 
+    async def unit_props(self) -> Optional[dict]:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "show", self.unit, "-p", "ActiveState,SubState,NRestarts,ExecMainStatus",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, _ = await proc.communicate()
+        except FileNotFoundError:
+            return None
+        return dict(line.split("=", 1) for line in out.decode(errors="replace").splitlines() if "=" in line)
+
+    async def restart_unit(self, requested_by: str) -> discord.Embed:
+        """Run the configured restart command and report the resulting unit state."""
+        cmd = self.cfg["systemd"]["restart_cmd"].format(unit=self.unit)
+        log.warning("Restart of %s requested by %s (%s)", self.unit, requested_by, cmd)
+        await self.send_alert(f"Manual restart: {self.unit}",
+                              f"Restart requested by **{requested_by}** via /trrestart.", BLUE)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *shlex.split(cmd),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except FileNotFoundError as exc:
+            return discord.Embed(title="Restart failed", color=RED,
+                                 description=f"Cannot run restart command: `{exc}`")
+        except asyncio.TimeoutError:
+            proc.kill()
+            return discord.Embed(title="Restart failed", color=RED,
+                                 description="Restart command timed out after 30s.")
+        text = out.decode(errors="replace").strip()
+        if proc.returncode != 0:
+            hint = ""
+            if "sudo" in cmd and ("password" in text.lower() or "sudoers" in text.lower()):
+                hint = ("\nThe bot's user needs a sudoers rule, e.g.:\n"
+                        f"```\n<bot-user> ALL=(root) NOPASSWD: /usr/bin/systemctl restart {self.unit}\n```")
+            return discord.Embed(title="Restart failed", color=RED,
+                                 description=f"`{cmd}` exited {proc.returncode}:\n"
+                                             f"```text\n{text[:600] or '(no output)'}\n```{hint}")
+
+        # Restart command succeeded — wait for the unit to come back up.
+        for _ in range(10):
+            await asyncio.sleep(2)
+            props = await self.unit_props()
+            if props and props.get("ActiveState") == "active" and props.get("SubState") == "running":
+                return discord.Embed(
+                    title=f"{self.unit} restarted", color=GREEN,
+                    description=f"Unit is **active/running** (requested by {requested_by}).")
+        props = await self.unit_props() or {}
+        state = f"{props.get('ActiveState', '?')}/{props.get('SubState', '?')}"
+        journal = await self.journal_tail(int(self.cfg["systemd"]["journal_lines"]))
+        return discord.Embed(
+            title=f"{self.unit} restart: not running", color=RED,
+            description=f"The restart command succeeded but the unit is **{state}** after 20s. "
+                        f"Recent journal:\n```text\n{journal}\n```")
+
     async def update_online(self, online: bool, exec_status: str):
         if self.online is None:
             self.online = online
@@ -458,15 +526,10 @@ class TRBot(discord.Client):
         failed_alerted = False
 
         while not self.is_closed():
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "systemctl", "show", self.unit, "-p", "ActiveState,SubState,NRestarts,ExecMainStatus",
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                out, _ = await proc.communicate()
-            except FileNotFoundError:
+            props = await self.unit_props()
+            if props is None:
                 log.error("systemctl not available; cannot watch the unit")
                 return
-            props = dict(line.split("=", 1) for line in out.decode(errors="replace").splitlines() if "=" in line)
             active = props.get("ActiveState", "unknown")
             sub = props.get("SubState", "")
             exec_status = props.get("ExecMainStatus", "?")

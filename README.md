@@ -17,9 +17,17 @@ dongles. No broker, no plugin, nothing to add to trunk-recorder's build.
 | Hung process (optional) | Unit active but journal silent — requires `controlWarnRate: -1` so trunk-recorder logs its rate every ~3 s as a heartbeat | 🟠 critical |
 | Log relay | `warning`+ journal lines forwarded, batched into code blocks | posted to a logs channel |
 
-There is also a `/trstatus` slash command showing unit state, restart count,
-per-system decode rates, dongle presence, and upload-failure counters, and a
-`/trprobe` command that actively probes the dongles at the driver level.
+Slash commands:
+
+- `/trstatus` — unit state, restart count, per-system decode rates, dongle
+  presence, upload-failure counters.
+- `/trprobe` — actively probe the dongles at the driver level (see below).
+- `/trrestart confirm: True` — restart the trunk-recorder service. Restricted
+  to members with **Manage Server** by default (adjust per-command in Server
+  Settings → Integrations), requires the explicit `confirm` flag since it
+  stops in-progress recordings, posts an audit alert naming the requester,
+  and reports the resulting unit state (with a journal excerpt on failure).
+  Needs a sudoers rule on the host — see setup below.
 
 ### Dongle health is three layers
 
@@ -107,6 +115,18 @@ The bot's user must be able to read the unit's journal:
 ```bash
 sudo usermod -aG systemd-journal <bot-user>
 ```
+
+For `/trrestart`, allow the bot's user to restart exactly that one unit and
+nothing else:
+
+```bash
+echo '<bot-user> ALL=(root) NOPASSWD: /usr/bin/systemctl restart trunk-recorder.service' \
+  | sudo tee /etc/sudoers.d/tr-discord-bot
+sudo chmod 0440 /etc/sudoers.d/tr-discord-bot
+```
+
+(Check the path with `which systemctl`; without this rule the command fails
+cleanly and the bot's reply includes the rule to add.)
 
 ### 4. Run as a service
 

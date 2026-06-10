@@ -22,6 +22,11 @@ systemd:
   restart_window_s: 300         # restarts within this window count toward a crash loop
   restart_threshold: 3          # this many restarts in the window => crash-loop alert
   restart_alert_cooldown_s: 600 # min seconds between single-restart alerts
+  # Command run by /trrestart ({unit} is substituted). The bot's user needs a
+  # sudoers rule for exactly this command — see README. The slash command is
+  # restricted to members with Manage Server by default (adjustable in
+  # Server Settings -> Integrations) and requires confirm: True.
+  restart_cmd: "sudo -n systemctl restart {unit}"
 
 watchdog:
   # Decode-rate health, parsed from trunk-recorder's own log lines.
