@@ -48,12 +48,15 @@ logs:
 
 usb:
   # SDRs to watch via udev. Find IDs with `lsusb` (ID 0bda:2838) and serials
-  # with `lsusb -v -d 0bda:2838 | grep iSerial` (or rtl_eeprom). Empty list
-  # disables the watcher. serial is optional but recommended with multiple
-  # identical dongles.
-  devices: []
-  # devices:
-  #   - label: "RTL-SDR control channel"
-  #     vendor_id: "0bda"
-  #     product_id: "2838"
-  #     serial: "00000001"
+  # via sysfs: for d in /sys/bus/usb/devices/*/; do cat $d/serial; done
+  # (or rtl_eeprom). Empty list disables the watcher. serial is optional but
+  # required in practice with multiple identical dongles.
+  devices:
+    - label: "RTL-SDR Blog V4 #00000110"
+      vendor_id: "0bda"
+      product_id: "2838"
+      serial: "00000110"
+    - label: "RTL-SDR Blog V4 #00000109"
+      vendor_id: "0bda"
+      product_id: "2838"
+      serial: "00000109"
