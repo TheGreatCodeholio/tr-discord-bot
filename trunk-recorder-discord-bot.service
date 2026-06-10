@@ -1,0 +1,18 @@
+[Unit]
+Description=Trunk Recorder Discord watchdog bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust user and paths to your install location.
+User=trunkrecorder
+WorkingDirectory=/opt/tr-discord-bot
+ExecStart=/opt/tr-discord-bot/venv/bin/python bot.py -c config.yaml
+# Token can live here instead of config.yaml if preferred:
+#Environment=DISCORD_TOKEN=your-token
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

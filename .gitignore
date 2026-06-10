@@ -1,0 +1,6 @@
+# Local secrets and environment
+config.yaml
+venv/
+__pycache__/
+*.pyc
+.idea/

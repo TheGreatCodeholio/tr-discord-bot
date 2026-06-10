@@ -1,0 +1,34 @@
+# trunk-recorder Discord watchdog bot — copy to config.yaml and edit.
+
+mqtt:
+  host: localhost
+  port: 1883
+  username: ""          # leave empty if the broker allows anonymous access
+  password: ""
+  # Must match the "topic" of the MQTT Status plugin block in trunk-recorder's
+  # config.json. The bot subscribes to:
+  #   <topic>/trunk_recorder/status   (online/offline, Last Will)
+  #   <topic>/rates                   (decode rates, ~every 3s)
+  #   <topic>/trunk_recorder/console  (log lines, needs console_logs: true)
+  topic: "trunkrecorder/feeds"
+
+discord:
+  token: ""             # or set the DISCORD_TOKEN environment variable
+  alerts_channel_id: 0  # required: channel for watchdog alerts
+  logs_channel_id: 0    # optional: channel for relayed log lines (0 = disabled)
+  # Prepended to critical alerts (offline, SDR down, lost calls), e.g.
+  # "<@&123456789012345678>" for a role ping, or "@here".
+  mention_on_critical: ""
+
+watchdog:
+  telemetry_timeout_s: 30       # no rates telemetry for this long => "hung" alert
+  decode_rate_min: 3.0          # msg/s below this counts as unhealthy
+  decode_rate_intervals: 10     # consecutive ~3s updates below min before alerting (~30s)
+  recovery_intervals: 3         # consecutive healthy updates before "recovered"
+  upload_alert_cooldown_s: 600  # min seconds between upload-failure alerts per service
+  realert_interval_s: 1800      # re-alert interval while a system stays down
+  extra_upload_services: []     # add names here if you renamed uploader plugins in config.json
+
+logs:
+  min_severity: warning         # trace|debug|info|warning|error|fatal
+  batch_interval_s: 5           # batch window for relayed log lines
