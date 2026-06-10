@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 """Discord watchdog + log relay bot for trunk-recorder.
 
-Subscribes to the MQTT topics published by the trunk-recorder-mqtt-status
-plugin (user_plugins/trunk-recorder-mqtt-status) and:
+Runs on the same host as trunk-recorder and watches it directly — no broker,
+no plugin:
 
-  * announces when trunk-recorder goes offline/online — the plugin registers
-    an MQTT Last Will, so the broker publishes "disconnected" even when the
-    process crashes hard
-  * alerts when telemetry goes silent (hung process / dead plugin)
-  * alerts when a system's control channel decode rate drops — the usual
-    symptom of an SDR falling off USB, antenna, or RF problems
-  * alerts on OpenMHz / Broadcastify Calls / Rdio Scanner upload failures,
-    including calls permanently lost after retries
-  * relays warning/error console log lines to a Discord channel
-
-It also watches the host directly (these paths work even when trunk-recorder
-dies before its MQTT plugin ever connects — e.g. a missing SDR at startup):
-
+  * journald tail (`journalctl -u <unit> -f -o json`): relays warning/error
+    log lines to a Discord channel, classifies upload failures (OpenMHz /
+    Broadcastify Calls / Rdio Scanner, including calls permanently lost after
+    retries), and tracks control-channel decode rates from trunk-recorder's
+    own rate log lines (SDR / antenna / RF problems)
+  * systemd unit watcher: online/offline transitions, single restarts, crash
+    loops, and failed state — with the last journal lines attached, so
+    startup errors like a missing SDR reach Discord
   * USB dongle watcher (udev): alerts the moment a configured SDR leaves or
     rejoins the bus, and checks presence at startup
-  * systemd unit watcher: alerts on restarts / crash loops / failed state and
-    attaches the last journal lines so the actual startup error reaches Discord
+  * optional log-silence hang detection: set `controlWarnRate: -1` in
+    trunk-recorder's config.json so it logs its decode rate every ~3 s, then
+    journal silence while the unit is active means the process is hung
 
 Configuration: config.yaml (see config.example.yaml). The Discord token can
 also be supplied via the DISCORD_TOKEN environment variable.
@@ -34,10 +30,9 @@ import os
 import re
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
-import aiomqtt
 import discord
 import yaml
 from discord import app_commands
@@ -52,6 +47,15 @@ ORANGE = 0xE67E22
 RED = 0xE74C3C
 BLUE = 0x3498DB
 
+# trunk-recorder's Boost.Log console format: "[<timestamp>] (<severity>)   <message>"
+BOOST_LINE_RE = re.compile(
+    r"^\[(?P<ts>[^\]]*)\]\s+\((?P<sev>trace|debug|info|warning|error|fatal)\)\s*(?P<body>.*)$")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+TIME_RE = re.compile(r"(\d{2}:\d{2}:\d{2})")
+
+# monitor_systems.cc: "[<shortname>]\tfreq: ...\tControl Channel Message Decode Rate: <n>/sec, count: ..."
+RATE_RE = re.compile(r"\[(?P<sys>[^\]]+)\].*Control Channel Message Decode Rate:\s*(?P<rate>-?\d+)/sec")
+
 DEFAULT_UPLOAD_SERVICES = ["OpenMHz", "Broadcastify", "Rdio Scanner"]
 UPLOAD_ERROR_RE = re.compile(r"Upload (?:Error|REJECTED|failed)", re.IGNORECASE)
 UPLOAD_PERMANENT_RE = re.compile(r"Upload failed after \d+ retry attempts", re.IGNORECASE)
@@ -60,6 +64,7 @@ UPLOAD_PERMANENT_RE = re.compile(r"Upload failed after \d+ retry attempts", re.I
 @dataclass
 class SysHealth:
     last_rate: float = 0.0
+    last_seen: float = 0.0       # when a rate line for this system last appeared
     low_intervals: int = 0
     ok_intervals: int = 0
     down: bool = False
@@ -81,13 +86,6 @@ def load_config(path: str) -> dict:
         cfg = yaml.safe_load(f) or {}
 
     defaults = {
-        "mqtt": {
-            "host": "localhost",
-            "port": 1883,
-            "username": "",
-            "password": "",
-            "topic": "trunkrecorder/feeds",
-        },
         "discord": {
             "token": "",
             "alerts_channel_id": 0,
@@ -95,10 +93,11 @@ def load_config(path: str) -> dict:
             "mention_on_critical": "",
         },
         "watchdog": {
-            "telemetry_timeout_s": 30,
             "decode_rate_min": 3.0,
             "decode_rate_intervals": 10,
             "recovery_intervals": 3,
+            "decode_rate_clear_s": 30,
+            "log_silence_timeout_s": 0,
             "upload_alert_cooldown_s": 600,
             "realert_interval_s": 1800,
             "extra_upload_services": [],
@@ -111,7 +110,7 @@ def load_config(path: str) -> dict:
             "devices": [],
         },
         "systemd": {
-            "unit": "",
+            "unit": "trunk-recorder.service",
             "poll_interval_s": 10,
             "journal_lines": 25,
             "restart_window_s": 300,
@@ -131,27 +130,19 @@ class TRBot(discord.Client):
         super().__init__(intents=discord.Intents.default())
         self.cfg = cfg
         self.tree = app_commands.CommandTree(self)
-
-        self.base_topic = cfg["mqtt"]["topic"].rstrip("/")
-        self.instance_id = "trunk-recorder"
+        self.unit = cfg["systemd"]["unit"]
 
         # Watchdog state
-        self.online: Optional[bool] = None       # None until first status message
-        self.mqtt_connected = False
-        self.last_rates: Optional[float] = None
-        self.telemetry_silent = False
-        self.systems: dict[str, SysHealth] = {}
-        self.uploads: dict[str, UploadHealth] = {}
-        self.started = time.time()
-
-        # Online/offline flap suppression (crash loops)
-        self.transitions: deque = deque(maxlen=20)
-        self.flapping = False
-
-        # Host watchers
-        self.usb_present: dict[str, bool] = {}    # label -> currently on the bus
+        self.online: Optional[bool] = None       # None until first systemd poll
         self.unit_state = "unknown"
         self.unit_restarts: Optional[int] = None
+        self.crash_looping = False
+        self.last_journal: Optional[float] = None
+        self.log_silent = False
+        self.systems: dict[str, SysHealth] = {}
+        self.uploads: dict[str, UploadHealth] = {}
+        self.usb_present: dict[str, bool] = {}    # label -> currently on the bus
+        self.started = time.time()
 
         # Log relay
         self.log_queue: asyncio.Queue = asyncio.Queue()
@@ -173,11 +164,11 @@ class TRBot(discord.Client):
 
     async def setup_hook(self):
         await self.tree.sync()
-        asyncio.create_task(self.mqtt_loop(), name="mqtt_loop")
+        asyncio.create_task(self.journal_watcher(), name="journal_watcher")
+        asyncio.create_task(self.systemd_watcher(), name="systemd_watcher")
         asyncio.create_task(self.watchdog_loop(), name="watchdog_loop")
         asyncio.create_task(self.log_flusher(), name="log_flusher")
         asyncio.create_task(self.usb_watcher(), name="usb_watcher")
-        asyncio.create_task(self.systemd_watcher(), name="systemd_watcher")
 
     async def on_ready(self):
         log.info("Logged in to Discord as %s", self.user)
@@ -207,7 +198,7 @@ class TRBot(discord.Client):
             return
         content = self.cfg["discord"]["mention_on_critical"] if critical else None
         embed = discord.Embed(title=title, description=description, color=color)
-        embed.set_footer(text=self.instance_id)
+        embed.set_footer(text=self.unit)
         for attempt in range(5):
             try:
                 await ch.send(content=content or None, embed=embed)
@@ -220,217 +211,149 @@ class TRBot(discord.Client):
     def status_embed(self) -> discord.Embed:
         now = time.time()
         if self.online is None:
-            state, color = "unknown (no status message yet)", BLUE
+            state, color = "unknown (no systemd poll yet)", BLUE
         elif self.online:
             state, color = "online", GREEN
         else:
             state, color = "OFFLINE", RED
+        if self.crash_looping:
+            state += " (crash-looping)"
+            color = RED
 
         embed = discord.Embed(title="Trunk Recorder status", color=color)
-        embed.add_field(name="Recorder", value=state + (" (flapping)" if self.flapping else ""), inline=True)
-        embed.add_field(name="MQTT broker", value="connected" if self.mqtt_connected else "DISCONNECTED", inline=True)
-        if self.last_rates is not None:
-            embed.add_field(name="Last telemetry", value=f"{now - self.last_rates:.0f}s ago", inline=True)
-        if self.cfg["systemd"]["unit"]:
-            restarts = "?" if self.unit_restarts is None else str(self.unit_restarts)
-            embed.add_field(name=f"Unit: {self.cfg['systemd']['unit']}",
-                            value=f"{self.unit_state}, {restarts} restart(s)", inline=True)
-        for label, present in sorted(self.usb_present.items()):
-            embed.add_field(name=f"SDR: {label}",
-                            value="on the bus" if present else "\N{LARGE RED CIRCLE} MISSING", inline=True)
+        restarts = "?" if self.unit_restarts is None else str(self.unit_restarts)
+        embed.add_field(name=f"Unit: {self.unit}",
+                        value=f"{state} ({self.unit_state}, {restarts} restart(s))", inline=True)
+        if self.last_journal is not None:
+            embed.add_field(name="Last log line", value=f"{now - self.last_journal:.0f}s ago", inline=True)
         for name, h in sorted(self.systems.items()):
             flag = " \N{LARGE RED CIRCLE} DOWN" if h.down else ""
-            embed.add_field(name=f"System: {name}", value=f"{h.last_rate:.1f} msg/s{flag}", inline=True)
+            age = f", {now - h.last_seen:.0f}s ago" if h.last_seen else ""
+            embed.add_field(name=f"System: {name}", value=f"{h.last_rate:.0f} msg/s{age}{flag}", inline=True)
         for svc, u in sorted(self.uploads.items()):
             embed.add_field(
                 name=f"Uploads: {svc}",
                 value=f"{u.failures_total} failure(s), {u.permanent_total} call(s) lost",
                 inline=True,
             )
-        embed.set_footer(text=f"{self.instance_id} • bot up {(now - self.started) / 3600:.1f}h")
+        for label, present in sorted(self.usb_present.items()):
+            embed.add_field(name=f"SDR: {label}",
+                            value="on the bus" if present else "\N{LARGE RED CIRCLE} MISSING", inline=True)
+        embed.set_footer(text=f"{self.unit} • bot up {(now - self.started) / 3600:.1f}h")
         return embed
 
     # ------------------------------------------------------------------
-    # MQTT
+    # Journal tail — log relay, upload failures, decode rates
     # ------------------------------------------------------------------
 
-    async def mqtt_loop(self):
-        cfg = self.cfg["mqtt"]
+    async def journal_watcher(self):
+        await self.wait_until_ready()
         delay = 5
-        announced_loss = False
+        announced = False
         while not self.is_closed():
+            proc = None
             try:
-                client_args = {"hostname": cfg["host"], "port": int(cfg["port"])}
-                if cfg["username"]:
-                    client_args["username"] = cfg["username"]
-                    client_args["password"] = cfg["password"]
-                async with aiomqtt.Client(**client_args) as client:
-                    await client.subscribe(f"{self.base_topic}/trunk_recorder/status")
-                    await client.subscribe(f"{self.base_topic}/rates")
-                    await client.subscribe(f"{self.base_topic}/trunk_recorder/console")
-                    log.info("Connected to MQTT broker %s:%s", cfg["host"], cfg["port"])
-                    self.mqtt_connected = True
-                    # Don't count broker downtime as recorder telemetry silence.
-                    self.last_rates = time.time()
-                    if announced_loss:
-                        announced_loss = False
-                        await self.send_alert("Watchdog reconnected",
-                                              "Bot reconnected to the MQTT broker; monitoring resumed.", GREEN)
+                proc = await asyncio.create_subprocess_exec(
+                    "journalctl", "-u", self.unit, "-f", "-n", "0", "-o", "json",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                log.info("Tailing journal for %s", self.unit)
+                while True:
+                    raw = await proc.stdout.readline()
+                    if not raw:
+                        break
                     delay = 5
-                    async for message in client.messages:
-                        await self.handle_mqtt(str(message.topic), message.payload)
-            except aiomqtt.MqttError as exc:
-                first_loss = self.mqtt_connected
-                self.mqtt_connected = False
-                log.warning("MQTT connection error: %s (retry in %ds)", exc, delay)
-                if first_loss and not announced_loss:
-                    announced_loss = True
+                    try:
+                        rec = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    message = rec.get("MESSAGE", "")
+                    if isinstance(message, list):  # journald encodes non-UTF8 as a byte array
+                        message = bytes(message).decode("utf-8", errors="replace")
+                    await self.handle_log_line(ANSI_RE.sub("", str(message)))
+                err = (await proc.stderr.read()).decode(errors="replace").strip()
+                raise RuntimeError(err[:300] or f"journalctl exited ({proc.returncode})")
+            except (FileNotFoundError, RuntimeError) as exc:
+                log.error("journal tail failed: %s (retry in %ds)", exc, delay)
+                if not announced:
+                    announced = True
                     await self.send_alert(
-                        "Watchdog blind",
-                        f"Bot lost its connection to the MQTT broker (`{exc}`). "
-                        "Monitoring is suspended until it reconnects — trunk-recorder itself may be fine.",
-                        ORANGE, critical=True)
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 300)
+                        "Watchdog blind: journal unavailable",
+                        f"`journalctl -u {self.unit} -f` failed: `{exc}`\n"
+                        "Log relay, upload-failure, and decode-rate monitoring are suspended. "
+                        "Is the bot's user in the `systemd-journal` group?", ORANGE, critical=True)
+            finally:
+                if proc and proc.returncode is None:
+                    proc.kill()
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 300)
 
-    async def handle_mqtt(self, topic: str, payload: bytes):
-        try:
-            data = json.loads(payload.decode("utf-8", errors="replace")) if payload else {}
-        except json.JSONDecodeError:
-            log.warning("Unparseable payload on %s", topic)
-            return
-        if not isinstance(data, dict):
-            return
-        self.instance_id = data.get("instance_id", self.instance_id)
-
-        if topic.endswith("/trunk_recorder/status"):
-            await self.handle_status(data)
-        elif topic.endswith("/rates"):
-            self.handle_rates(data)
-        elif topic.endswith("/trunk_recorder/console"):
-            await self.handle_console(data)
-
-    # ------------------------------------------------------------------
-    # Recorder online/offline (LWT)
-    # ------------------------------------------------------------------
-
-    async def handle_status(self, data: dict):
-        status = data.get("status")
-        if status not in ("connected", "disconnected"):
-            return
-        online = status == "connected"
-
-        if self.online is None:
-            self.online = online
-            if online:
-                await self.send_alert("Watchdog started",
-                                      "Trunk Recorder is currently **online**.", GREEN)
-            else:
-                await self.send_alert(
-                    "Watchdog started — recorder OFFLINE",
-                    "The retained status at the broker says Trunk Recorder is **offline** "
-                    "(stopped, crashed, or never started).", RED, critical=True)
-            return
-
-        if online == self.online:
-            return
-        self.online = online
-
-        # Flap suppression: a recorder that cycles online/offline (e.g. it
-        # survives long enough to connect MQTT, then crashes again) would spam
-        # a pair of alerts per cycle. Collapse that into one "flapping" alert.
-        now = time.time()
-        self.transitions.append(now)
-        recent = [t for t in self.transitions if now - t < 600]
-        if self.flapping:
-            return
-        if len(recent) >= 4:
-            self.flapping = True
-            await self.send_alert(
-                "Trunk Recorder is flapping",
-                f"**{len(recent)}** online/offline transitions in the last 10 minutes — "
-                "it is likely crash-looping. Individual transition alerts are muted until "
-                "the state has been stable for 10 minutes. Check the systemd journal.",
-                RED, critical=True)
-            return
-
-        if online:
-            self.last_rates = time.time()
-            self.telemetry_silent = False
-            await self.send_alert("Trunk Recorder is back online",
-                                  "MQTT status changed to **connected**.", GREEN)
+    async def handle_log_line(self, message: str):
+        self.last_journal = time.time()
+        m = BOOST_LINE_RE.match(message)
+        if m:
+            severity, body, ts = m.group("sev"), m.group("body").strip(), m.group("ts")
         else:
-            await self.send_alert(
-                "Trunk Recorder went OFFLINE",
-                "The broker published the plugin's Last Will: the process **crashed, was stopped, "
-                "or lost its MQTT connection**. If systemd manages it, check "
-                "`systemctl status trunk-recorder` and the journal.", RED, critical=True)
-
-    # ------------------------------------------------------------------
-    # Decode rates (SDR / control channel health) — every ~3s
-    # ------------------------------------------------------------------
-
-    def handle_rates(self, data: dict):
-        self.last_rates = time.time()
-        for entry in data.get("rates") or []:
-            name = entry.get("sys_name") or f"sys{entry.get('sys_num', '?')}"
-            try:
-                rate = float(entry.get("decoderate", 0.0))
-            except (TypeError, ValueError):
-                continue
-            h = self.systems.setdefault(name, SysHealth())
-            h.last_rate = rate
-            w = self.cfg["watchdog"]
-            now = time.time()
-
-            if rate < float(w["decode_rate_min"]):
-                h.low_intervals += 1
-                h.ok_intervals = 0
-                if not h.down and h.low_intervals >= int(w["decode_rate_intervals"]):
-                    h.down = True
-                    h.last_alert = now
-                    asyncio.create_task(self.send_alert(
-                        f"Decode rate low: {name}",
-                        f"Control channel decode rate has been below {w['decode_rate_min']} msg/s for "
-                        f"{h.low_intervals} consecutive updates (currently {rate:.1f} msg/s).\n"
-                        "Likely causes: **SDR dropped off USB**, antenna/RF problem, or the control "
-                        "channel moved. Trunk-recorder will try to retune; if it hits its retune "
-                        "limit it exits (which this bot reports as OFFLINE).", ORANGE, critical=True))
-                elif h.down and now - h.last_alert >= float(w["realert_interval_s"]):
-                    h.last_alert = now
-                    asyncio.create_task(self.send_alert(
-                        f"Still down: {name}",
-                        f"Decode rate is still below {w['decode_rate_min']} msg/s "
-                        f"(currently {rate:.1f} msg/s).", ORANGE))
-            else:
-                h.ok_intervals += 1
-                h.low_intervals = 0
-                if h.down and h.ok_intervals >= int(w["recovery_intervals"]):
-                    h.down = False
-                    asyncio.create_task(self.send_alert(
-                        f"Recovered: {name}",
-                        f"Decode rate is back to {rate:.1f} msg/s.", GREEN))
-
-    # ------------------------------------------------------------------
-    # Console log lines: relay + upload failure classification
-    # ------------------------------------------------------------------
-
-    async def handle_console(self, data: dict):
-        entry = data.get("console") or {}
-        severity = str(entry.get("severity", "info")).lower()
-        message = str(entry.get("log_msg", "")).strip()
-        if not message:
+            # Not a Boost.Log line (e.g. gr-osmosdr/UHD writing straight to stderr)
+            severity, body, ts = "info", message.strip(), ""
+        if not body:
             return
         rank = SEVERITY_RANK.get(severity, 2)
 
         if self.cfg["discord"]["logs_channel_id"] and rank >= self.relay_min_rank:
-            stamp = str(entry.get("time", ""))[11:19]  # HH:MM:SS from ISO time
+            tm = TIME_RE.search(ts)
+            stamp = tm.group(1) if tm else time.strftime("%H:%M:%S")
             emoji = SEVERITY_EMOJI.get(severity, "")
-            line = f"[{stamp}] {emoji}({severity}) {message}"
-            self.log_queue.put_nowait(line[:1800])
+            self.log_queue.put_nowait(f"[{stamp}] {emoji}({severity}) {body}"[:1800])
+
+        rate_match = RATE_RE.search(body)
+        if rate_match:
+            await self.handle_decode_rate(rate_match.group("sys"), float(rate_match.group("rate")))
 
         if rank >= SEVERITY_RANK["error"]:
-            await self.classify_upload_failure(message)
+            await self.classify_upload_failure(body)
+
+    # ------------------------------------------------------------------
+    # Decode rates (SDR / control channel health)
+    #
+    # trunk-recorder logs a rate line every ~3s whenever the decode rate is
+    # below controlWarnRate (default 10), and at info level every ~3s for all
+    # rates if controlWarnRate is -1. Healthy systems with the default config
+    # log nothing, so recovery is also detected by the *absence* of low-rate
+    # lines (decode_rate_clear_s in watchdog_loop).
+    # ------------------------------------------------------------------
+
+    async def handle_decode_rate(self, name: str, rate: float):
+        w = self.cfg["watchdog"]
+        now = time.time()
+        h = self.systems.setdefault(name, SysHealth())
+        h.last_rate = rate
+        h.last_seen = now
+
+        if rate < float(w["decode_rate_min"]):
+            h.low_intervals += 1
+            h.ok_intervals = 0
+            if not h.down and h.low_intervals >= int(w["decode_rate_intervals"]):
+                h.down = True
+                h.last_alert = now
+                await self.send_alert(
+                    f"Decode rate low: {name}",
+                    f"Control channel decode rate has been below {w['decode_rate_min']} msg/s for "
+                    f"{h.low_intervals} consecutive updates (currently {rate:.0f} msg/s).\n"
+                    "Likely causes: **SDR dropped off USB**, antenna/RF problem, or the control "
+                    "channel moved.", ORANGE, critical=True)
+            elif h.down and now - h.last_alert >= float(w["realert_interval_s"]):
+                h.last_alert = now
+                await self.send_alert(
+                    f"Still down: {name}",
+                    f"Decode rate is still below {w['decode_rate_min']} msg/s "
+                    f"(currently {rate:.0f} msg/s).", ORANGE)
+        else:
+            h.ok_intervals += 1
+            h.low_intervals = 0
+            if h.down and h.ok_intervals >= int(w["recovery_intervals"]):
+                h.down = False
+                await self.send_alert(f"Recovered: {name}",
+                                      f"Decode rate is back to {rate:.0f} msg/s.", GREEN)
 
     async def classify_upload_failure(self, message: str):
         permanent = bool(UPLOAD_PERMANENT_RE.search(message))
@@ -469,34 +392,155 @@ class TRBot(discord.Client):
         u.permanent = 0
 
     # ------------------------------------------------------------------
-    # Telemetry silence watchdog
+    # systemd unit watcher — online/offline, restarts, crash loops
+    # ------------------------------------------------------------------
+
+    async def journal_tail(self, lines: int) -> str:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "journalctl", "-u", self.unit, "-n", str(lines), "--no-pager", "-o", "cat",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, err = await proc.communicate()
+            if proc.returncode != 0:
+                return f"(journalctl failed: {err.decode(errors='replace').strip()[:200]})"
+            return ANSI_RE.sub("", out.decode(errors="replace")).strip()[-900:] or "(journal empty)"
+        except FileNotFoundError:
+            return "(journalctl not available)"
+
+    async def update_online(self, online: bool, exec_status: str):
+        if self.online is None:
+            self.online = online
+            if online:
+                await self.send_alert("Watchdog started",
+                                      f"`{self.unit}` is currently **active**.", GREEN)
+            else:
+                await self.send_alert(
+                    f"Watchdog started — {self.unit} not running",
+                    f"The unit is **{self.unit_state}**.", RED, critical=True)
+            return
+        if online == self.online:
+            return
+        self.online = online
+        if self.crash_looping:
+            return  # the crash-loop alert covers the churn
+        if online:
+            await self.send_alert(f"{self.unit} is back online",
+                                  "The unit is active and running.", GREEN)
+        else:
+            journal = await self.journal_tail(int(self.cfg["systemd"]["journal_lines"]))
+            await self.send_alert(
+                f"{self.unit} went OFFLINE",
+                f"The unit is **{self.unit_state}** (last exit status {exec_status}). "
+                f"Recent journal:\n```text\n{journal}\n```", RED, critical=True)
+
+    async def systemd_watcher(self):
+        sd = self.cfg["systemd"]
+        await self.wait_until_ready()
+        restart_times: deque = deque(maxlen=50)
+        last_restart_alert = 0.0
+        failed_alerted = False
+
+        while not self.is_closed():
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "systemctl", "show", self.unit, "-p", "ActiveState,SubState,NRestarts,ExecMainStatus",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                out, _ = await proc.communicate()
+            except FileNotFoundError:
+                log.error("systemctl not available; cannot watch the unit")
+                return
+            props = dict(line.split("=", 1) for line in out.decode(errors="replace").splitlines() if "=" in line)
+            active = props.get("ActiveState", "unknown")
+            sub = props.get("SubState", "")
+            exec_status = props.get("ExecMainStatus", "?")
+            self.unit_state = f"{active}/{sub}"
+            try:
+                restarts = int(props.get("NRestarts", "0") or 0)
+            except ValueError:
+                restarts = 0
+            now = time.time()
+
+            if self.unit_restarts is not None and restarts > self.unit_restarts:
+                restart_times.extend([now] * (restarts - self.unit_restarts))
+                recent = [t for t in restart_times if now - t < float(sd["restart_window_s"])]
+                if len(recent) >= int(sd["restart_threshold"]):
+                    if not self.crash_looping:
+                        self.crash_looping = True
+                        journal = await self.journal_tail(int(sd["journal_lines"]))
+                        await self.send_alert(
+                            f"{self.unit} is crash-looping",
+                            f"**{len(recent)}** restarts in the last {int(sd['restart_window_s']) // 60} "
+                            f"minutes (exit status {exec_status}). Recent journal:\n"
+                            f"```text\n{journal}\n```", RED, critical=True)
+                elif now - last_restart_alert >= float(sd["restart_alert_cooldown_s"]):
+                    last_restart_alert = now
+                    journal = await self.journal_tail(int(sd["journal_lines"]))
+                    await self.send_alert(
+                        f"{self.unit} restarted",
+                        f"systemd restarted the unit (exit status {exec_status}, "
+                        f"restart #{restarts}). Recent journal:\n```text\n{journal}\n```",
+                        ORANGE, critical=True)
+            elif self.crash_looping and active == "active" and sub == "running" \
+                    and not [t for t in restart_times if now - t < float(sd["restart_window_s"])]:
+                self.crash_looping = False
+                await self.send_alert(f"{self.unit} stable again",
+                                      "The unit has been running without restarts.", GREEN)
+            self.unit_restarts = restarts
+
+            if active == "failed" and not failed_alerted:
+                failed_alerted = True
+                journal = await self.journal_tail(int(sd["journal_lines"]))
+                await self.send_alert(
+                    f"{self.unit} FAILED",
+                    f"systemd gave up on the unit (state {self.unit_state}). It will **not** restart "
+                    f"on its own. Recent journal:\n```text\n{journal}\n```", RED, critical=True)
+            elif active != "failed":
+                failed_alerted = False
+
+            # "activating"/auto-restart states are transient; don't flip online state on them
+            if active in ("active", "inactive", "failed"):
+                await self.update_online(active == "active", exec_status)
+
+            await asyncio.sleep(float(sd["poll_interval_s"]))
+
+    # ------------------------------------------------------------------
+    # Periodic checks: log-silence hang detection, decode-rate clear
     # ------------------------------------------------------------------
 
     async def watchdog_loop(self):
         await self.wait_until_ready()
-        timeout = float(self.cfg["watchdog"]["telemetry_timeout_s"])
+        w = self.cfg["watchdog"]
+        silence_timeout = float(w["log_silence_timeout_s"])
+        clear_s = float(w["decode_rate_clear_s"])
         while not self.is_closed():
             now = time.time()
-            if self.mqtt_connected and self.online is not False and self.last_rates is not None:
-                silent = (now - self.last_rates) > timeout
-                if silent and not self.telemetry_silent:
-                    self.telemetry_silent = True
+
+            if silence_timeout > 0 and self.online and self.last_journal is not None:
+                silent = (now - self.last_journal) > silence_timeout
+                if silent and not self.log_silent:
+                    self.log_silent = True
                     await self.send_alert(
-                        "Telemetry silent",
-                        f"No decode-rate telemetry for over {timeout:.0f}s while the recorder still "
-                        "appears connected. The process may be **hung** or the MQTT plugin is wedged.",
+                        "Log output silent",
+                        f"No journal output from `{self.unit}` for over {silence_timeout:.0f}s while "
+                        "the unit is still active. The process may be **hung**. (This check assumes "
+                        "`controlWarnRate: -1` so trunk-recorder logs its decode rate every ~3s.)",
                         ORANGE, critical=True)
-                elif not silent and self.telemetry_silent:
-                    self.telemetry_silent = False
-                    await self.send_alert("Telemetry resumed",
-                                          "Decode-rate telemetry is flowing again.", GREEN)
-            if self.flapping and self.transitions and (now - self.transitions[-1]) > 600:
-                self.flapping = False
-                state = "online" if self.online else "OFFLINE"
-                await self.send_alert(
-                    "Flapping stopped",
-                    f"No state changes for 10 minutes. Trunk Recorder is currently **{state}**.",
-                    GREEN if self.online else RED, critical=not self.online)
+                elif not silent and self.log_silent:
+                    self.log_silent = False
+                    await self.send_alert("Log output resumed",
+                                          "Journal output is flowing again.", GREEN)
+
+            # With the default controlWarnRate (10), healthy systems log no rate
+            # lines at all — so "the low-rate error lines stopped" means recovered.
+            for name, h in self.systems.items():
+                if h.down and h.last_seen and (now - h.last_seen) > clear_s and self.online:
+                    h.down = False
+                    h.low_intervals = 0
+                    await self.send_alert(
+                        f"Recovered: {name}",
+                        f"No low decode-rate lines for {clear_s:.0f}s — the rate is back above "
+                        "trunk-recorder's warn threshold.", GREEN)
+
             await asyncio.sleep(5)
 
     # ------------------------------------------------------------------
@@ -594,91 +638,6 @@ class TRBot(discord.Client):
                             "restart to pick it up.", GREEN)
 
     # ------------------------------------------------------------------
-    # systemd unit watcher — catches crash loops that never reach MQTT
-    # ------------------------------------------------------------------
-
-    async def journal_tail(self, unit: str, lines: int) -> str:
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "journalctl", "-u", unit, "-n", str(lines), "--no-pager", "-o", "cat",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            out, err = await proc.communicate()
-            if proc.returncode != 0:
-                return f"(journalctl failed: {err.decode(errors='replace').strip()[:200]})"
-            return out.decode(errors="replace").strip()[-900:] or "(journal empty)"
-        except FileNotFoundError:
-            return "(journalctl not available)"
-
-    async def systemd_watcher(self):
-        sd = self.cfg["systemd"]
-        unit = sd["unit"]
-        if not unit:
-            return
-        await self.wait_until_ready()
-        restart_times: deque = deque(maxlen=50)
-        last_restart_alert = 0.0
-        failed_alerted = False
-        loop_alerted = False
-
-        while not self.is_closed():
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "systemctl", "show", unit, "-p", "ActiveState,SubState,NRestarts,ExecMainStatus",
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                out, _ = await proc.communicate()
-            except FileNotFoundError:
-                log.error("systemctl not available; systemd watching disabled")
-                return
-            props = dict(line.split("=", 1) for line in out.decode(errors="replace").splitlines() if "=" in line)
-            active = props.get("ActiveState", "unknown")
-            sub = props.get("SubState", "")
-            self.unit_state = f"{active}/{sub}"
-            try:
-                restarts = int(props.get("NRestarts", "0") or 0)
-            except ValueError:
-                restarts = 0
-            now = time.time()
-
-            if self.unit_restarts is not None and restarts > self.unit_restarts:
-                restart_times.extend([now] * (restarts - self.unit_restarts))
-                recent = [t for t in restart_times if now - t < float(sd["restart_window_s"])]
-                if len(recent) >= int(sd["restart_threshold"]):
-                    if not loop_alerted:
-                        loop_alerted = True
-                        journal = await self.journal_tail(unit, int(sd["journal_lines"]))
-                        await self.send_alert(
-                            f"{unit} is crash-looping",
-                            f"**{len(recent)}** restarts in the last {int(sd['restart_window_s']) // 60} "
-                            f"minutes (exit status {props.get('ExecMainStatus', '?')}). Recent journal:\n"
-                            f"```text\n{journal}\n```", RED, critical=True)
-                elif now - last_restart_alert >= float(sd["restart_alert_cooldown_s"]):
-                    last_restart_alert = now
-                    journal = await self.journal_tail(unit, int(sd["journal_lines"]))
-                    await self.send_alert(
-                        f"{unit} restarted",
-                        f"systemd restarted the unit (exit status {props.get('ExecMainStatus', '?')}, "
-                        f"restart #{restarts}). Recent journal:\n```text\n{journal}\n```",
-                        ORANGE, critical=True)
-            elif loop_alerted and active == "active" and sub == "running" \
-                    and not [t for t in restart_times if now - t < float(sd["restart_window_s"])]:
-                loop_alerted = False
-                await self.send_alert(f"{unit} stable again",
-                                      "The unit has been running without restarts.", GREEN)
-            self.unit_restarts = restarts
-
-            if active == "failed" and not failed_alerted:
-                failed_alerted = True
-                journal = await self.journal_tail(unit, int(sd["journal_lines"]))
-                await self.send_alert(
-                    f"{unit} FAILED",
-                    f"systemd gave up on the unit (state {self.unit_state}). It will **not** restart "
-                    f"on its own. Recent journal:\n```text\n{journal}\n```", RED, critical=True)
-            elif active != "failed":
-                failed_alerted = False
-
-            await asyncio.sleep(float(sd["poll_interval_s"]))
-
-    # ------------------------------------------------------------------
     # Log relay flusher — batches lines, never drops them
     # ------------------------------------------------------------------
 
@@ -728,6 +687,8 @@ def main():
         raise SystemExit("No Discord token: set discord.token in config.yaml or the DISCORD_TOKEN env var")
     if not cfg["discord"]["alerts_channel_id"]:
         raise SystemExit("discord.alerts_channel_id must be set")
+    if not cfg["systemd"]["unit"]:
+        raise SystemExit("systemd.unit must be set (the trunk-recorder unit to watch)")
 
     TRBot(cfg).run(token, log_handler=None)
 
