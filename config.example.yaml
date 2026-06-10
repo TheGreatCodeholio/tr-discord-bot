@@ -32,3 +32,30 @@ watchdog:
 logs:
   min_severity: warning         # trace|debug|info|warning|error|fatal
   batch_interval_s: 5           # batch window for relayed log lines
+
+# Host-level watchers — these work even when trunk-recorder dies before its
+# MQTT plugin connects (e.g. SDR missing at startup => instant exit).
+usb:
+  # SDRs to watch via udev. Find IDs with `lsusb` (ID 0bda:2838) and serials
+  # with `lsusb -v -d 0bda:2838 | grep iSerial` (or rtl_eeprom). Empty list
+  # disables the watcher. serial is optional but recommended with multiple
+  # identical dongles.
+  devices: []
+  # devices:
+  #   - label: "RTL-SDR control channel"
+  #     vendor_id: "0bda"
+  #     product_id: "2838"
+  #     serial: "00000001"
+
+systemd:
+  # Name of the trunk-recorder unit to watch ("" disables). The bot polls
+  # systemctl and alerts on restarts, crash loops, and failed state, attaching
+  # the last journal lines so startup errors reach Discord even though MQTT
+  # never connected. Reading the journal requires the bot's user to be in the
+  # systemd-journal group.
+  unit: ""                      # e.g. "trunk-recorder.service"
+  poll_interval_s: 10
+  journal_lines: 25
+  restart_window_s: 300         # restarts within this window count toward a crash loop
+  restart_threshold: 3          # this many restarts in the window => crash-loop alert
+  restart_alert_cooldown_s: 600 # min seconds between single-restart alerts

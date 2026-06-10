@@ -16,7 +16,17 @@ with the `console_logs_level` option).
 | SDR drops off USB / antenna / RF problem | Per-system control-channel decode rate stays below a threshold | 🟠 critical, with recovery notice |
 | Upload failures to OpenMHz / Broadcastify Calls / Rdio Scanner | Error log lines matched per service, rate-limited per service | 🟠 (🔴 + ping when calls are permanently lost after retries) |
 | Bot loses the MQTT broker | Connection error in the bot | 🟠 "watchdog blind" |
+| SDR dongle leaves/rejoins the USB bus | **udev events on the host** (plus a presence check at startup) — independent of trunk-recorder's state | 🔴 critical, with reconnect notice |
+| trunk-recorder crash-loops or fails under systemd | `systemctl show` polling (`NRestarts`, `ActiveState`) with the last journal lines attached | 🔴 critical |
 | Log relay | `warning`+ console lines forwarded, batched into code blocks | posted to a logs channel |
+
+The last two host-level watchers exist because of a startup ordering fact in
+trunk-recorder: sources are created in `load_config()` **before** plugins
+start, so if an SDR is missing at startup the process exits before the MQTT
+plugin ever connects — nothing is published, and MQTT-only monitoring would
+never see the error or the resulting systemd crash loop. The journal excerpt
+in the restart alert is how the actual error (e.g. `Failed to open rtlsdr
+device`) reaches Discord.
 
 There is also a `/trstatus` slash command showing recorder state, per-system
 decode rates, telemetry age, and upload-failure counters.
@@ -24,8 +34,18 @@ decode rates, telemetry age, and upload-failure counters.
 Limitations worth knowing:
 
 - Decode-rate monitoring only covers **trunked** systems; conventional-only
-  systems don't publish a rate, so a dead SDR there only shows up via log
-  lines / silence of call activity.
+  systems don't publish a rate. The USB watcher covers the dead-dongle case
+  there; other RF problems only show up via log lines / silence of call
+  activity.
+- The USB and systemd watchers require the bot to run **on the same host** as
+  trunk-recorder. Reading the journal needs the bot's user in the
+  `systemd-journal` group (`sudo usermod -aG systemd-journal <user>`).
+- A runtime dongle yank does **not** make trunk-recorder exit by default
+  (`controlRetuneLimit` defaults to 0 = retry forever) — it just retunes with
+  a 0 msg/s decode rate. You'll get the USB alert and the decode-rate alert;
+  restarting trunk-recorder after the dongle returns is on you (or set
+  `controlRetuneLimit` in trunk-recorder's config so it exits and systemd
+  restarts it).
 - "Offline" cannot distinguish a crash from a deliberate stop — the alert text
   says so. Whole-host failures are only caught if the broker and bot run
   somewhere that survives them (currently both run on the recorder host).

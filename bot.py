@@ -14,6 +14,14 @@ plugin (user_plugins/trunk-recorder-mqtt-status) and:
     including calls permanently lost after retries
   * relays warning/error console log lines to a Discord channel
 
+It also watches the host directly (these paths work even when trunk-recorder
+dies before its MQTT plugin ever connects — e.g. a missing SDR at startup):
+
+  * USB dongle watcher (udev): alerts the moment a configured SDR leaves or
+    rejoins the bus, and checks presence at startup
+  * systemd unit watcher: alerts on restarts / crash loops / failed state and
+    attaches the last journal lines so the actual startup error reaches Discord
+
 Configuration: config.yaml (see config.example.yaml). The Discord token can
 also be supplied via the DISCORD_TOKEN environment variable.
 """
@@ -25,7 +33,8 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Optional
 
 import aiomqtt
@@ -98,6 +107,17 @@ def load_config(path: str) -> dict:
             "min_severity": "warning",
             "batch_interval_s": 5,
         },
+        "usb": {
+            "devices": [],
+        },
+        "systemd": {
+            "unit": "",
+            "poll_interval_s": 10,
+            "journal_lines": 25,
+            "restart_window_s": 300,
+            "restart_threshold": 3,
+            "restart_alert_cooldown_s": 600,
+        },
     }
     for section, keys in defaults.items():
         cfg.setdefault(section, {})
@@ -124,6 +144,15 @@ class TRBot(discord.Client):
         self.uploads: dict[str, UploadHealth] = {}
         self.started = time.time()
 
+        # Online/offline flap suppression (crash loops)
+        self.transitions: deque = deque(maxlen=20)
+        self.flapping = False
+
+        # Host watchers
+        self.usb_present: dict[str, bool] = {}    # label -> currently on the bus
+        self.unit_state = "unknown"
+        self.unit_restarts: Optional[int] = None
+
         # Log relay
         self.log_queue: asyncio.Queue = asyncio.Queue()
         self.relay_min_rank = SEVERITY_RANK.get(cfg["logs"]["min_severity"].lower(), 3)
@@ -147,6 +176,8 @@ class TRBot(discord.Client):
         asyncio.create_task(self.mqtt_loop(), name="mqtt_loop")
         asyncio.create_task(self.watchdog_loop(), name="watchdog_loop")
         asyncio.create_task(self.log_flusher(), name="log_flusher")
+        asyncio.create_task(self.usb_watcher(), name="usb_watcher")
+        asyncio.create_task(self.systemd_watcher(), name="systemd_watcher")
 
     async def on_ready(self):
         log.info("Logged in to Discord as %s", self.user)
@@ -196,10 +227,17 @@ class TRBot(discord.Client):
             state, color = "OFFLINE", RED
 
         embed = discord.Embed(title="Trunk Recorder status", color=color)
-        embed.add_field(name="Recorder", value=state, inline=True)
+        embed.add_field(name="Recorder", value=state + (" (flapping)" if self.flapping else ""), inline=True)
         embed.add_field(name="MQTT broker", value="connected" if self.mqtt_connected else "DISCONNECTED", inline=True)
         if self.last_rates is not None:
             embed.add_field(name="Last telemetry", value=f"{now - self.last_rates:.0f}s ago", inline=True)
+        if self.cfg["systemd"]["unit"]:
+            restarts = "?" if self.unit_restarts is None else str(self.unit_restarts)
+            embed.add_field(name=f"Unit: {self.cfg['systemd']['unit']}",
+                            value=f"{self.unit_state}, {restarts} restart(s)", inline=True)
+        for label, present in sorted(self.usb_present.items()):
+            embed.add_field(name=f"SDR: {label}",
+                            value="on the bus" if present else "\N{LARGE RED CIRCLE} MISSING", inline=True)
         for name, h in sorted(self.systems.items()):
             flag = " \N{LARGE RED CIRCLE} DOWN" if h.down else ""
             embed.add_field(name=f"System: {name}", value=f"{h.last_rate:.1f} msg/s{flag}", inline=True)
@@ -297,6 +335,25 @@ class TRBot(discord.Client):
         if online == self.online:
             return
         self.online = online
+
+        # Flap suppression: a recorder that cycles online/offline (e.g. it
+        # survives long enough to connect MQTT, then crashes again) would spam
+        # a pair of alerts per cycle. Collapse that into one "flapping" alert.
+        now = time.time()
+        self.transitions.append(now)
+        recent = [t for t in self.transitions if now - t < 600]
+        if self.flapping:
+            return
+        if len(recent) >= 4:
+            self.flapping = True
+            await self.send_alert(
+                "Trunk Recorder is flapping",
+                f"**{len(recent)}** online/offline transitions in the last 10 minutes — "
+                "it is likely crash-looping. Individual transition alerts are muted until "
+                "the state has been stable for 10 minutes. Check the systemd journal.",
+                RED, critical=True)
+            return
+
         if online:
             self.last_rates = time.time()
             self.telemetry_silent = False
@@ -433,7 +490,193 @@ class TRBot(discord.Client):
                     self.telemetry_silent = False
                     await self.send_alert("Telemetry resumed",
                                           "Decode-rate telemetry is flowing again.", GREEN)
+            if self.flapping and self.transitions and (now - self.transitions[-1]) > 600:
+                self.flapping = False
+                state = "online" if self.online else "OFFLINE"
+                await self.send_alert(
+                    "Flapping stopped",
+                    f"No state changes for 10 minutes. Trunk Recorder is currently **{state}**.",
+                    GREEN if self.online else RED, critical=not self.online)
             await asyncio.sleep(5)
+
+    # ------------------------------------------------------------------
+    # USB dongle watcher (udev) — works even when trunk-recorder is dead
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _usb_ids(device) -> tuple:
+        vid = (device.get("ID_VENDOR_ID") or "").lower()
+        pid = (device.get("ID_MODEL_ID") or "").lower()
+        serial = device.get("ID_SERIAL_SHORT") or ""
+        if not vid and device.get("PRODUCT"):
+            # remove events sometimes only carry PRODUCT=vid/pid/rev
+            parts = device.get("PRODUCT").split("/")
+            if len(parts) >= 2:
+                vid, pid = parts[0].zfill(4).lower(), parts[1].zfill(4).lower()
+        return vid, pid, serial
+
+    def _match_usb_spec(self, vid: str, pid: str, serial: str) -> Optional[dict]:
+        for spec in self.cfg["usb"]["devices"]:
+            if (str(spec.get("vendor_id", "")).lower() == vid
+                    and str(spec.get("product_id", "")).lower() == pid
+                    and (not spec.get("serial") or str(spec["serial"]) == serial)):
+                return spec
+        return None
+
+    async def usb_watcher(self):
+        specs = self.cfg["usb"]["devices"]
+        if not specs:
+            return
+        try:
+            import pyudev
+        except ImportError:
+            log.error("usb.devices configured but pyudev is not installed; USB watching disabled")
+            return
+        await self.wait_until_ready()
+
+        context = pyudev.Context()
+        syspath_to_label: dict[str, str] = {}
+
+        # Startup presence check
+        for spec in specs:
+            self.usb_present[spec.get("label", f"{spec.get('vendor_id')}:{spec.get('product_id')}")] = False
+        for device in context.list_devices(subsystem="usb", DEVTYPE="usb_device"):
+            vid, pid, serial = self._usb_ids(device)
+            spec = self._match_usb_spec(vid, pid, serial)
+            if spec:
+                label = spec.get("label", f"{vid}:{pid}")
+                self.usb_present[label] = True
+                syspath_to_label[device.sys_path] = label
+        missing = [label for label, present in self.usb_present.items() if not present]
+        if missing:
+            await self.send_alert(
+                "SDR missing at startup",
+                "Expected USB device(s) not on the bus: **" + ", ".join(missing) + "**.\n"
+                "trunk-recorder cannot start without them — if it is crash-looping under "
+                "systemd, this is why.", RED, critical=True)
+
+        # Live udev events
+        monitor = pyudev.Monitor.from_netlink(context)
+        monitor.filter_by("usb")
+        monitor.start()
+        queue: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        loop.add_reader(monitor.fileno(), lambda: queue.put_nowait(monitor.poll(0)))
+
+        while not self.is_closed():
+            device = await queue.get()
+            if device is None or device.device_type != "usb_device":
+                continue
+            if device.action == "remove":
+                label = syspath_to_label.pop(device.sys_path, None)
+                if label is None:
+                    vid, pid, serial = self._usb_ids(device)
+                    spec = self._match_usb_spec(vid, pid, serial)
+                    label = spec.get("label", f"{vid}:{pid}") if spec else None
+                if label:
+                    self.usb_present[label] = False
+                    await self.send_alert(
+                        f"SDR disconnected: {label}",
+                        "The dongle **left the USB bus**. Recordings on its systems have stopped; "
+                        "if trunk-recorder exits or restarts it will fail to start until the "
+                        "device returns.", RED, critical=True)
+            elif device.action in ("add", "bind"):
+                vid, pid, serial = self._usb_ids(device)
+                spec = self._match_usb_spec(vid, pid, serial)
+                if spec:
+                    label = spec.get("label", f"{vid}:{pid}")
+                    syspath_to_label[device.sys_path] = label
+                    if not self.usb_present.get(label, False):
+                        self.usb_present[label] = True
+                        await self.send_alert(
+                            f"SDR connected: {label}",
+                            "The dongle is back on the USB bus. trunk-recorder may need a "
+                            "restart to pick it up.", GREEN)
+
+    # ------------------------------------------------------------------
+    # systemd unit watcher — catches crash loops that never reach MQTT
+    # ------------------------------------------------------------------
+
+    async def journal_tail(self, unit: str, lines: int) -> str:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "journalctl", "-u", unit, "-n", str(lines), "--no-pager", "-o", "cat",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, err = await proc.communicate()
+            if proc.returncode != 0:
+                return f"(journalctl failed: {err.decode(errors='replace').strip()[:200]})"
+            return out.decode(errors="replace").strip()[-900:] or "(journal empty)"
+        except FileNotFoundError:
+            return "(journalctl not available)"
+
+    async def systemd_watcher(self):
+        sd = self.cfg["systemd"]
+        unit = sd["unit"]
+        if not unit:
+            return
+        await self.wait_until_ready()
+        restart_times: deque = deque(maxlen=50)
+        last_restart_alert = 0.0
+        failed_alerted = False
+        loop_alerted = False
+
+        while not self.is_closed():
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "systemctl", "show", unit, "-p", "ActiveState,SubState,NRestarts,ExecMainStatus",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                out, _ = await proc.communicate()
+            except FileNotFoundError:
+                log.error("systemctl not available; systemd watching disabled")
+                return
+            props = dict(line.split("=", 1) for line in out.decode(errors="replace").splitlines() if "=" in line)
+            active = props.get("ActiveState", "unknown")
+            sub = props.get("SubState", "")
+            self.unit_state = f"{active}/{sub}"
+            try:
+                restarts = int(props.get("NRestarts", "0") or 0)
+            except ValueError:
+                restarts = 0
+            now = time.time()
+
+            if self.unit_restarts is not None and restarts > self.unit_restarts:
+                restart_times.extend([now] * (restarts - self.unit_restarts))
+                recent = [t for t in restart_times if now - t < float(sd["restart_window_s"])]
+                if len(recent) >= int(sd["restart_threshold"]):
+                    if not loop_alerted:
+                        loop_alerted = True
+                        journal = await self.journal_tail(unit, int(sd["journal_lines"]))
+                        await self.send_alert(
+                            f"{unit} is crash-looping",
+                            f"**{len(recent)}** restarts in the last {int(sd['restart_window_s']) // 60} "
+                            f"minutes (exit status {props.get('ExecMainStatus', '?')}). Recent journal:\n"
+                            f"```text\n{journal}\n```", RED, critical=True)
+                elif now - last_restart_alert >= float(sd["restart_alert_cooldown_s"]):
+                    last_restart_alert = now
+                    journal = await self.journal_tail(unit, int(sd["journal_lines"]))
+                    await self.send_alert(
+                        f"{unit} restarted",
+                        f"systemd restarted the unit (exit status {props.get('ExecMainStatus', '?')}, "
+                        f"restart #{restarts}). Recent journal:\n```text\n{journal}\n```",
+                        ORANGE, critical=True)
+            elif loop_alerted and active == "active" and sub == "running" \
+                    and not [t for t in restart_times if now - t < float(sd["restart_window_s"])]:
+                loop_alerted = False
+                await self.send_alert(f"{unit} stable again",
+                                      "The unit has been running without restarts.", GREEN)
+            self.unit_restarts = restarts
+
+            if active == "failed" and not failed_alerted:
+                failed_alerted = True
+                journal = await self.journal_tail(unit, int(sd["journal_lines"]))
+                await self.send_alert(
+                    f"{unit} FAILED",
+                    f"systemd gave up on the unit (state {self.unit_state}). It will **not** restart "
+                    f"on its own. Recent journal:\n```text\n{journal}\n```", RED, critical=True)
+            elif active != "failed":
+                failed_alerted = False
+
+            await asyncio.sleep(float(sd["poll_interval_s"]))
 
     # ------------------------------------------------------------------
     # Log relay flusher — batches lines, never drops them
