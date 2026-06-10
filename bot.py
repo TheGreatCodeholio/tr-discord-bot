@@ -109,6 +109,7 @@ def load_config(path: str) -> dict:
     defaults = {
         "discord": {
             "token": "",
+            "guild_id": 0,
             "alerts_channel_id": 0,
             "logs_channel_id": 0,
             "mention_on_critical": "",
@@ -260,7 +261,20 @@ class TRBot(discord.Client):
     # ------------------------------------------------------------------
 
     async def setup_hook(self):
-        await self.tree.sync()
+        guild_id = int(self.cfg["discord"].get("guild_id", 0) or 0)
+        if guild_id:
+            # Guild-scoped commands appear instantly; global ones can take up
+            # to an hour to propagate. Copy the commands into the guild, then
+            # clear the global set so stale global copies don't show twice.
+            guild = discord.Object(id=guild_id)
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
+            log.info("Slash commands synced to guild %d", guild_id)
+        else:
+            await self.tree.sync()
+            log.info("Slash commands synced globally (propagation can take up to an hour)")
         asyncio.create_task(self.journal_watcher(), name="journal_watcher")
         asyncio.create_task(self.systemd_watcher(), name="systemd_watcher")
         asyncio.create_task(self.watchdog_loop(), name="watchdog_loop")

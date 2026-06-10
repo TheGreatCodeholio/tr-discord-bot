@@ -5,6 +5,11 @@
 
 discord:
   token: ""             # or set the DISCORD_TOKEN environment variable
+  # Your server's ID (right-click the server name with Developer Mode on).
+  # When set, slash commands sync to this server instantly on bot startup;
+  # when 0, they sync globally and Discord can take up to an hour to show
+  # changes. Set this unless the bot serves multiple servers.
+  guild_id: 0
   alerts_channel_id: 0  # required: channel for watchdog alerts
   logs_channel_id: 0    # optional: channel for relayed log lines (0 = disabled)
   # Prepended to critical alerts (offline, SDR down, lost calls).
